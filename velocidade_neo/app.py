@@ -16,15 +16,29 @@ st.set_page_config(
 )
 
 st.title("🚗 Cobli — Tempo Rodado por Período")
-st.caption("Versão simplificada, sem mapa, usando apenas Streamlit, Pandas, Plotly e Requests.")
+st.caption("Versão simplificada, sem mapa, com linha do tempo separando movimento, motor ocioso e parado normal.")
 
-# Cores fixas dos gráficos
+# =========================
+# Cores fixas
+# =========================
 COLOR_MOVIMENTO = "#1565C0"      # azul
-COLOR_PARADO = "#D32F2F"         # vermelho
-COLOR_OCIOSO = "#F9A825"         # amarelo
-COLOR_MOTOR_OFF = "#757575"      # cinza
-COLOR_DISTANCIA = "#2E7D32"      # verde
-COLOR_FUNDO_LINHA = "#EEEEEE"
+COLOR_OCIOSO = "#FF8F00"         # laranja
+COLOR_PARADO_NORMAL = "#2E7D32"  # verde
+COLOR_FUNDO_LINHA = "#E0E0E0"    # cinza claro
+COLOR_DISTANCIA = "#455A64"      # cinza azulado
+COLOR_PARADAS = "#6A1B9A"        # roxo
+
+TIMELINE_COLORS = {
+    "trip": COLOR_MOVIMENTO,
+    "idle": COLOR_OCIOSO,
+    "parked": COLOR_PARADO_NORMAL,
+}
+
+TIMELINE_LABELS = {
+    "trip": "Em movimento",
+    "idle": "Motor ocioso",
+    "parked": "Parado normal",
+}
 
 
 # =========================
@@ -98,7 +112,7 @@ def api_get(url: str, api_key: str):
 
 
 def date_to_ms(selected_date: date, timezone_name: str, end_of_day: bool = False) -> int:
-    """Converte uma data para timestamp em milissegundos respeitando o fuso."""
+    """Converte data para timestamp em milissegundos respeitando o fuso."""
     if end_of_day:
         dt = datetime.combine(selected_date, datetime.max.time().replace(second=59, microsecond=0))
     else:
@@ -106,6 +120,29 @@ def date_to_ms(selected_date: date, timezone_name: str, end_of_day: bool = False
 
     tz = pytz.timezone(timezone_name)
     return int(tz.localize(dt).timestamp() * 1000)
+
+
+def timestamp_to_datetime(timestamp_value: int, timezone_name: str) -> datetime:
+    """Converte timestamp da API para datetime local."""
+    if timestamp_value > 1e10:
+        timestamp_value = timestamp_value / 1000
+
+    return (
+        datetime.utcfromtimestamp(timestamp_value)
+        .replace(tzinfo=pytz.utc)
+        .astimezone(pytz.timezone(timezone_name))
+        .replace(tzinfo=None)
+    )
+
+
+def safe_number(value, default: float = 0) -> float:
+    """Converte número com segurança."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # =========================
@@ -132,8 +169,7 @@ def get_paths_summary(license_plate: str, start: date, end: date, timezone_name:
         body = api_get(url, api_key)
         all_data.extend(body.get("data", []))
 
-        has_next_page = body.get("pagination", {}).get("next")
-        if not has_next_page:
+        if not body.get("pagination", {}).get("next"):
             break
 
         page += 1
@@ -156,7 +192,7 @@ def get_vehicle_route(vehicle_id: str, begin_ms: int, end_ms: int, timezone_name
 
 
 # =========================
-# Tratamento de dados
+# Tratamento do resumo diário
 # =========================
 def parse_summary_date(summary: dict):
     """Extrai a melhor data disponível no item de resumo."""
@@ -184,11 +220,11 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
             start_address = summary.get("start_address") or {}
             end_address = summary.get("end_address") or {}
 
-            stop_total_s = stops.get("duration") or 0
-            idle_s = stops.get("idle_time_duration") or 0
+            stop_total_s = safe_number(stops.get("duration"))
+            idle_s = safe_number(stops.get("idle_time_duration"))
             parked_s = max(0, stop_total_s - idle_s)
 
-            drive_s = trip.get("duration") or 0
+            drive_s = safe_number(trip.get("duration"))
             start_text = (start_address.get("date") or "").replace("T", " ")
             end_text = (end_address.get("date") or "").replace("T", " ")
 
@@ -208,16 +244,16 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
                     "data": raw_date,
                     "inicio": start_text,
                     "fim": end_text,
-                    "distancia_km": (trip.get("distance_in_meters") or 0) / 1000,
+                    "distancia_km": safe_number(trip.get("distance_in_meters")) / 1000,
                     "tempo_rodando_s": drive_s,
                     "tempo_rodando_h": drive_s / 3600,
                     "tempo_parado_s": stop_total_s,
                     "tempo_ocioso_s": idle_s,
                     "tempo_ocioso_h": idle_s / 3600,
-                    "tempo_parado_motor_off_s": parked_s,
-                    "tempo_parado_motor_off_h": parked_s / 3600,
-                    "paradas": stops.get("count") or 0,
-                    "paradas_geofence": stops.get("count_in_geofence") or 0,
+                    "tempo_parado_normal_s": parked_s,
+                    "tempo_parado_normal_h": parked_s / 3600,
+                    "paradas": int(safe_number(stops.get("count"))),
+                    "paradas_geofence": int(safe_number(stops.get("count_in_geofence"))),
                 }
             )
 
@@ -231,47 +267,133 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
     return df
 
 
-def timestamp_to_datetime(timestamp_ms: int, timezone_name: str) -> datetime:
-    """Converte timestamp da API para datetime local."""
-    if timestamp_ms > 1e10:
-        timestamp_ms = timestamp_ms / 1000
+# =========================
+# Tratamento dos segmentos da rota
+# =========================
+def extract_idle_duration_from_step(step: dict, duration_s: float) -> float:
+    """
+    Tenta identificar tempo de motor ocioso dentro de um step de parada.
 
-    return (
-        datetime.utcfromtimestamp(timestamp_ms)
-        .replace(tzinfo=pytz.utc)
-        .astimezone(pytz.timezone(timezone_name))
-        .replace(tzinfo=None)
-    )
+    A API pode variar o nome do campo dependendo do endpoint/versão.
+    Por isso, testamos alguns nomes comuns. Se nada existir, retorna 0.
+    """
+    possible_keys = [
+        "idle_time_duration",
+        "idle_duration",
+        "idleTimeDuration",
+        "idle_time",
+        "idleTime",
+        "engine_idle_duration",
+        "engineIdleDuration",
+    ]
+
+    for key in possible_keys:
+        if key in step:
+            value = safe_number(step.get(key))
+            # Se vier em milissegundos, converte para segundos.
+            if value > duration_s * 10 and value > 1000:
+                value = value / 1000
+            return max(0, min(value, duration_s))
+
+    # Alguns retornos podem trazer metadados aninhados.
+    for nested_key in ["stop", "stops", "metadata", "properties"]:
+        nested = step.get(nested_key)
+        if isinstance(nested, dict):
+            for key in possible_keys:
+                if key in nested:
+                    value = safe_number(nested.get(key))
+                    if value > duration_s * 10 and value > 1000:
+                        value = value / 1000
+                    return max(0, min(value, duration_s))
+
+    # Fallback por sinal de ignição ligada, se existir.
+    ignition_fields = ["ignition_on", "ignitionOn", "engine_on", "engineOn", "vehicle_on", "vehicleOn"]
+    for field in ignition_fields:
+        if field in step and step.get(field) is True:
+            return duration_s
+
+    return 0
 
 
 def build_route_segments(route_data: list, timezone_name: str) -> pd.DataFrame:
-    """Transforma os steps da rota em segmentos para a linha do tempo."""
+    """
+    Transforma os route_steps em segmentos para a linha do tempo.
+
+    Tipos finais:
+    - trip: em movimento
+    - idle: parado com motor ligado
+    - parked: parado normal
+    """
     rows = []
 
     for route in route_data:
         for step in route.get("route_steps", []):
             start_ts = step.get("start_time")
             end_ts = step.get("end_time")
+            step_type = step.get("type", "")
 
             if not start_ts or not end_ts:
                 continue
 
             divisor = 1000 if end_ts > 1e10 else 1
             duration_s = abs((end_ts - start_ts) / divisor)
+            start_dt = timestamp_to_datetime(start_ts, timezone_name)
+            end_dt = timestamp_to_datetime(end_ts, timezone_name)
 
-            rows.append(
-                {
-                    "tipo": step.get("type", ""),
-                    "inicio": timestamp_to_datetime(start_ts, timezone_name),
-                    "fim": timestamp_to_datetime(end_ts, timezone_name),
-                    "duracao_s": duration_s,
-                }
-            )
+            if duration_s <= 0:
+                continue
+
+            if step_type == "trip":
+                rows.append(
+                    {
+                        "tipo": "trip",
+                        "inicio": start_dt,
+                        "fim": end_dt,
+                        "duracao_s": duration_s,
+                    }
+                )
+
+            elif step_type == "stop":
+                idle_s = extract_idle_duration_from_step(step, duration_s)
+                parked_s = max(0, duration_s - idle_s)
+
+                # Se houver motor ocioso, pintamos primeiro a parte ociosa.
+                if idle_s > 0:
+                    idle_end = min(end_dt, start_dt + timedelta(seconds=idle_s))
+                    rows.append(
+                        {
+                            "tipo": "idle",
+                            "inicio": start_dt,
+                            "fim": idle_end,
+                            "duracao_s": idle_s,
+                        }
+                    )
+
+                    if parked_s > 0 and idle_end < end_dt:
+                        rows.append(
+                            {
+                                "tipo": "parked",
+                                "inicio": idle_end,
+                                "fim": end_dt,
+                                "duracao_s": parked_s,
+                            }
+                        )
+                else:
+                    rows.append(
+                        {
+                            "tipo": "parked",
+                            "inicio": start_dt,
+                            "fim": end_dt,
+                            "duracao_s": duration_s,
+                        }
+                    )
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
+    df["inicio"] = pd.to_datetime(df["inicio"])
+    df["fim"] = pd.to_datetime(df["fim"])
     return df.sort_values("inicio").reset_index(drop=True)
 
 
@@ -304,10 +426,10 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
     fig.add_trace(
         go.Bar(
             x=df["data_fmt"],
-            y=df["tempo_parado_motor_off_h"].round(2),
-            name="Parado motor off",
-            marker_color=COLOR_MOTOR_OFF,
-            hovertemplate="<b>%{x}</b><br>Parado: %{y:.2f}h<extra></extra>",
+            y=df["tempo_parado_normal_h"].round(2),
+            name="Parado normal",
+            marker_color=COLOR_PARADO_NORMAL,
+            hovertemplate="<b>%{x}</b><br>Parado normal: %{y:.2f}h<extra></extra>",
         )
     )
 
@@ -323,12 +445,12 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str) -> go.Figure:
+def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str, color: str) -> go.Figure:
     fig = go.Figure(
         go.Bar(
             x=df["data_fmt"],
             y=df[column],
-            marker_color=COLOR_DISTANCIA if column == "distancia_km" else COLOR_PARADO,
+            marker_color=color,
             hovertemplate="<b>%{x}</b><br>%{y}<extra></extra>",
         )
     )
@@ -337,7 +459,7 @@ def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str) -> g
 
 
 def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
-    """Monta uma linha do tempo por dia com cores fixas."""
+    """Monta uma linha do tempo por dia com cores fixas para os 3 estados."""
     reference = datetime(2000, 1, 1)
 
     def to_reference_time(dt: datetime) -> datetime:
@@ -353,28 +475,28 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
         y = y_map[day]
         day_label = pd.Timestamp(day).strftime("%d/%m/%Y")
 
-        # Linha de fundo do dia inteiro
+        # Fundo do dia inteiro.
         fig.add_trace(
             go.Scatter(
                 x=[reference, reference + timedelta(hours=24)],
                 y=[y, y],
                 mode="lines",
-                line=dict(color=COLOR_FUNDO_LINHA, width=18),
+                line=dict(color=COLOR_FUNDO_LINHA, width=20),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
         for _, segment in group.iterrows():
-            start = max(segment["inicio"], datetime.combine(day, datetime.min.time()))
-            end = min(segment["fim"], datetime.combine(day, datetime.max.time().replace(second=59)))
+            start = max(segment["inicio"].to_pydatetime(), datetime.combine(day, datetime.min.time()))
+            end = min(segment["fim"].to_pydatetime(), datetime.combine(day, datetime.max.time().replace(second=59)))
 
             if start >= end:
                 continue
 
-            is_trip = segment["tipo"] == "trip"
-            label = "Em movimento" if is_trip else "Parado / motor ocioso"
-            color = COLOR_MOVIMENTO if is_trip else COLOR_PARADO
+            tipo = segment["tipo"]
+            label = TIMELINE_LABELS.get(tipo, tipo)
+            color = TIMELINE_COLORS.get(tipo, "#000000")
             duration = fmt_duration(segment["duracao_s"])
             show_legend = label not in legend_added
 
@@ -401,7 +523,7 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
 
     tick_hours = list(range(0, 25, 2))
     fig.update_layout(
-        title="Linha do tempo — movimento e paradas",
+        title="Linha do tempo — movimento, motor ocioso e parado normal",
         height=max(300, len(days) * 55 + 120),
         margin=dict(l=10, r=10, t=50, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -420,6 +542,7 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
     )
 
     return fig
+
 
 # =========================
 # App principal
@@ -463,6 +586,7 @@ try:
     total_km = df["distancia_km"].sum()
     total_drive_s = df["tempo_rodando_s"].sum()
     total_idle_s = df["tempo_ocioso_s"].sum()
+    total_parked_s = df["tempo_parado_normal_s"].sum()
     total_paradas = int(df["paradas"].sum())
     active_days = int((df["distancia_km"] > 0).sum())
 
@@ -470,12 +594,13 @@ try:
         f"Placa: {vehicle_plate} · {start_date.strftime('%d/%m/%Y')} → {end_date.strftime('%d/%m/%Y')}"
     )
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Dias com atividade", active_days)
     col2.metric("Distância total", f"{total_km:,.1f} km")
-    col3.metric("Tempo em movimento", fmt_duration(total_drive_s))
+    col3.metric("Em movimento", fmt_duration(total_drive_s))
     col4.metric("Motor ocioso", fmt_duration(total_idle_s))
-    col5.metric("Total de paradas", f"{total_paradas:,}")
+    col5.metric("Parado normal", fmt_duration(total_parked_s))
+    col6.metric("Total de paradas", f"{total_paradas:,}")
 
     st.divider()
 
@@ -488,12 +613,20 @@ try:
 
         if not segments.empty:
             real_drive_s = segments.loc[segments["tipo"] == "trip", "duracao_s"].sum()
-            real_stop_s = segments.loc[segments["tipo"] == "stop", "duracao_s"].sum()
+            real_idle_s = segments.loc[segments["tipo"] == "idle", "duracao_s"].sum()
+            real_parked_s = segments.loc[segments["tipo"] == "parked", "duracao_s"].sum()
 
-            r1, r2, r3 = st.columns(3)
+            r1, r2, r3, r4 = st.columns(4)
             r1.metric("Em movimento real", fmt_duration(real_drive_s))
-            r2.metric("Parado real", fmt_duration(real_stop_s))
-            r3.metric("Segmentos de parada", len(segments[segments["tipo"] == "stop"]))
+            r2.metric("Motor ocioso real", fmt_duration(real_idle_s))
+            r3.metric("Parado normal real", fmt_duration(real_parked_s))
+            r4.metric("Segmentos", len(segments))
+
+            if real_idle_s == 0:
+                st.caption(
+                    "Observação: se a API de rota não retornar o tempo de motor ocioso por parada, "
+                    "a linha do tempo classifica as paradas como parado normal. O gráfico diário abaixo usa o resumo da API."
+                )
 
             st.plotly_chart(make_timeline_chart(segments, vehicle_plate), use_container_width=True)
         else:
@@ -506,13 +639,19 @@ try:
     col_a, col_b = st.columns(2)
     with col_a:
         st.plotly_chart(
-            make_bar_chart(df.assign(distancia_km=df["distancia_km"].round(1)), "distancia_km", "Distância por dia", "km"),
+            make_bar_chart(
+                df.assign(distancia_km=df["distancia_km"].round(1)),
+                "distancia_km",
+                "Distância por dia",
+                "km",
+                COLOR_DISTANCIA,
+            ),
             use_container_width=True,
         )
 
     with col_b:
         st.plotly_chart(
-            make_bar_chart(df, "paradas", "Paradas por dia", "Paradas"),
+            make_bar_chart(df, "paradas", "Paradas por dia", "Paradas", COLOR_PARADAS),
             use_container_width=True,
         )
 
@@ -526,7 +665,7 @@ try:
     table["Distância km"] = table["distancia_km"].round(1)
     table["Em movimento"] = table["tempo_rodando_s"].apply(fmt_duration)
     table["Motor ocioso"] = table["tempo_ocioso_s"].apply(fmt_duration)
-    table["Parado motor off"] = table["tempo_parado_motor_off_s"].apply(fmt_duration)
+    table["Parado normal"] = table["tempo_parado_normal_s"].apply(fmt_duration)
     table["Paradas"] = table["paradas"].astype(int)
 
     st.dataframe(
@@ -538,7 +677,7 @@ try:
                 "Distância km",
                 "Em movimento",
                 "Motor ocioso",
-                "Parado motor off",
+                "Parado normal",
                 "Paradas",
             ]
         ],
