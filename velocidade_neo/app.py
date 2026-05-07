@@ -18,6 +18,14 @@ st.set_page_config(
 st.title("🚗 Cobli — Tempo Rodado por Período")
 st.caption("Versão simplificada, sem mapa, usando apenas Streamlit, Pandas, Plotly e Requests.")
 
+# Cores fixas dos gráficos
+COLOR_MOVIMENTO = "#1565C0"      # azul
+COLOR_PARADO = "#D32F2F"         # vermelho
+COLOR_OCIOSO = "#F9A825"         # amarelo
+COLOR_MOTOR_OFF = "#757575"      # cinza
+COLOR_DISTANCIA = "#2E7D32"      # verde
+COLOR_FUNDO_LINHA = "#EEEEEE"
+
 
 # =========================
 # Sidebar
@@ -278,6 +286,7 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
             x=df["data_fmt"],
             y=df["tempo_rodando_h"].round(2),
             name="Em movimento",
+            marker_color=COLOR_MOVIMENTO,
             hovertemplate="<b>%{x}</b><br>Em movimento: %{y:.2f}h<extra></extra>",
         )
     )
@@ -287,6 +296,7 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
             x=df["data_fmt"],
             y=df["tempo_ocioso_h"].round(2),
             name="Motor ocioso",
+            marker_color=COLOR_OCIOSO,
             hovertemplate="<b>%{x}</b><br>Motor ocioso: %{y:.2f}h<extra></extra>",
         )
     )
@@ -296,6 +306,7 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
             x=df["data_fmt"],
             y=df["tempo_parado_motor_off_h"].round(2),
             name="Parado motor off",
+            marker_color=COLOR_MOTOR_OFF,
             hovertemplate="<b>%{x}</b><br>Parado: %{y:.2f}h<extra></extra>",
         )
     )
@@ -317,6 +328,7 @@ def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str) -> g
         go.Bar(
             x=df["data_fmt"],
             y=df[column],
+            marker_color=COLOR_DISTANCIA if column == "distancia_km" else COLOR_PARADO,
             hovertemplate="<b>%{x}</b><br>%{y}<extra></extra>",
         )
     )
@@ -325,7 +337,7 @@ def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str) -> g
 
 
 def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
-    """Monta uma linha do tempo por dia com movimento e parada."""
+    """Monta uma linha do tempo por dia com cores fixas."""
     reference = datetime(2000, 1, 1)
 
     def to_reference_time(dt: datetime) -> datetime:
@@ -335,10 +347,23 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
     y_map = {day: index for index, day in enumerate(days)}
 
     fig = go.Figure()
+    legend_added = set()
 
     for day, group in segments.groupby(segments["inicio"].dt.date, sort=False):
         y = y_map[day]
         day_label = pd.Timestamp(day).strftime("%d/%m/%Y")
+
+        # Linha de fundo do dia inteiro
+        fig.add_trace(
+            go.Scatter(
+                x=[reference, reference + timedelta(hours=24)],
+                y=[y, y],
+                mode="lines",
+                line=dict(color=COLOR_FUNDO_LINHA, width=18),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
 
         for _, segment in group.iterrows():
             start = max(segment["inicio"], datetime.combine(day, datetime.min.time()))
@@ -347,8 +372,11 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
             if start >= end:
                 continue
 
-            label = "Em movimento" if segment["tipo"] == "trip" else "Parado"
+            is_trip = segment["tipo"] == "trip"
+            label = "Em movimento" if is_trip else "Parado / motor ocioso"
+            color = COLOR_MOVIMENTO if is_trip else COLOR_PARADO
             duration = fmt_duration(segment["duracao_s"])
+            show_legend = label not in legend_added
 
             fig.add_trace(
                 go.Scatter(
@@ -356,27 +384,33 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
                     y=[y, y],
                     mode="lines",
                     name=label,
-                    line=dict(width=16),
+                    legendgroup=label,
+                    line=dict(color=color, width=16),
                     hovertemplate=(
                         f"<b>{plate} — {day_label}</b><br>"
                         f"{label}<br>"
                         f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}<br>"
                         f"Duração: {duration}<extra></extra>"
                     ),
-                    showlegend=False,
+                    showlegend=show_legend,
                 )
             )
+
+            if show_legend:
+                legend_added.add(label)
 
     tick_hours = list(range(0, 25, 2))
     fig.update_layout(
         title="Linha do tempo — movimento e paradas",
         height=max(300, len(days) * 55 + 120),
         margin=dict(l=10, r=10, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         xaxis=dict(
             tickvals=[reference + timedelta(hours=h) for h in tick_hours],
             ticktext=[f"{h:02d}:00" for h in tick_hours],
             range=[reference, reference + timedelta(hours=24)],
             title="Horário",
+            showgrid=True,
         ),
         yaxis=dict(
             tickvals=list(y_map.values()),
@@ -386,7 +420,6 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
     )
 
     return fig
-
 
 # =========================
 # App principal
