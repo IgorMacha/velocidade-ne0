@@ -21,12 +21,12 @@ st.caption("Versão simplificada, sem mapa, com linha do tempo separando movimen
 # =========================
 # Cores fixas
 # =========================
-COLOR_MOVIMENTO = "#1565C0"      # azul
-COLOR_OCIOSO = "#FF8F00"         # laranja
-COLOR_PARADO_NORMAL = "#2E7D32"  # verde
-COLOR_FUNDO_LINHA = "#E0E0E0"    # cinza claro
-COLOR_DISTANCIA = "#455A64"      # cinza azulado
-COLOR_PARADAS = "#6A1B9A"        # roxo
+COLOR_MOVIMENTO = "#1565C0"
+COLOR_OCIOSO = "#FF8F00"
+COLOR_PARADO_NORMAL = "#2E7D32"
+COLOR_FUNDO_LINHA = "#E0E0E0"
+COLOR_DISTANCIA = "#455A64"
+COLOR_PARADAS = "#6A1B9A"
 
 TIMELINE_COLORS = {
     "trip": COLOR_MOVIMENTO,
@@ -86,7 +86,6 @@ with st.sidebar:
 # Funções auxiliares
 # =========================
 def fmt_duration(seconds: float) -> str:
-    """Converte segundos para formato 0h 00min."""
     if not seconds or seconds < 0:
         return "0h 00min"
     hours = int(seconds // 3600)
@@ -95,7 +94,6 @@ def fmt_duration(seconds: float) -> str:
 
 
 def api_get(url: str, api_key: str):
-    """Faz GET na API da Cobli e trata erros HTTP."""
     response = requests.get(
         url,
         headers={"cobli-api-key": api_key},
@@ -112,7 +110,6 @@ def api_get(url: str, api_key: str):
 
 
 def date_to_ms(selected_date: date, timezone_name: str, end_of_day: bool = False) -> int:
-    """Converte data para timestamp em milissegundos respeitando o fuso."""
     if end_of_day:
         dt = datetime.combine(selected_date, datetime.max.time().replace(second=59, microsecond=0))
     else:
@@ -123,7 +120,6 @@ def date_to_ms(selected_date: date, timezone_name: str, end_of_day: bool = False
 
 
 def timestamp_to_datetime(timestamp_value: int, timezone_name: str) -> datetime:
-    """Converte timestamp da API para datetime local."""
     if timestamp_value > 1e10:
         timestamp_value = timestamp_value / 1000
 
@@ -136,7 +132,6 @@ def timestamp_to_datetime(timestamp_value: int, timezone_name: str) -> datetime:
 
 
 def safe_number(value, default: float = 0) -> float:
-    """Converte número com segurança."""
     try:
         if value is None:
             return default
@@ -150,7 +145,6 @@ def safe_number(value, default: float = 0) -> float:
 # =========================
 @st.cache_data(show_spinner=False, ttl=300)
 def get_paths_summary(license_plate: str, start: date, end: date, timezone_name: str, api_key: str) -> list:
-    """Busca o resumo diário da placa no período informado."""
     all_data = []
     page = 1
 
@@ -179,7 +173,6 @@ def get_paths_summary(license_plate: str, start: date, end: date, timezone_name:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def get_vehicle_route(vehicle_id: str, begin_ms: int, end_ms: int, timezone_name: str, api_key: str) -> list:
-    """Busca os segmentos de rota para montar a linha do tempo."""
     url = (
         "https://api.cobli.co/herbie-1.1/costs/vehicle-route"
         f"?vehicle_id={vehicle_id}"
@@ -195,7 +188,6 @@ def get_vehicle_route(vehicle_id: str, begin_ms: int, end_ms: int, timezone_name
 # Tratamento do resumo diário
 # =========================
 def parse_summary_date(summary: dict):
-    """Extrai a melhor data disponível no item de resumo."""
     for address_key in ["start_address", "end_address"]:
         address = summary.get(address_key) or {}
         for field in ["aggroupmentDate", "date"]:
@@ -205,8 +197,19 @@ def parse_summary_date(summary: dict):
     return None
 
 
+def _resolve_stop_total(stops: dict) -> float:
+    """
+    Tenta extrair a duração total de paradas do objeto stops.
+    A API pode retornar esse campo com nomes diferentes dependendo da versão.
+    """
+    for key in ["duration", "total_duration", "totalDuration", "stop_duration", "stopDuration", "total_time"]:
+        val = safe_number(stops.get(key))
+        if val > 0:
+            return val
+    return 0
+
+
 def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
-    """Transforma o retorno da API em uma tabela diária."""
     rows = []
 
     for item in summary_data:
@@ -220,7 +223,7 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
             start_address = summary.get("start_address") or {}
             end_address = summary.get("end_address") or {}
 
-            stop_total_s = safe_number(stops.get("duration"))
+            stop_total_s = _resolve_stop_total(stops)
             idle_s = safe_number(stops.get("idle_time_duration"))
             parked_s = max(0, stop_total_s - idle_s)
 
@@ -228,14 +231,28 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
             start_text = (start_address.get("date") or "").replace("T", " ")
             end_text = (end_address.get("date") or "").replace("T", " ")
 
-            # Algumas respostas da API podem trazer trip.duration zerado.
-            # Nesse caso, calculamos uma estimativa pelo intervalo total menos paradas.
+            # Fallback para drive_s zerado
             if drive_s == 0 and start_text and end_text:
                 try:
                     start_dt = datetime.fromisoformat(start_text)
                     end_dt = datetime.fromisoformat(end_text)
                     active_s = (end_dt - start_dt).total_seconds()
                     drive_s = max(0, active_s - stop_total_s)
+                except ValueError:
+                    pass
+
+            # -------------------------------------------------------
+            # Fallback para parked_s zerado:
+            # Se a API não retornou o total de paradas (ou retornou só
+            # o tempo ocioso sem o total), calcula pela diferença entre
+            # o período completo do dia e os tempos já conhecidos.
+            # -------------------------------------------------------
+            if parked_s == 0 and start_text and end_text:
+                try:
+                    start_dt = datetime.fromisoformat(start_text)
+                    end_dt = datetime.fromisoformat(end_text)
+                    total_period_s = (end_dt - start_dt).total_seconds()
+                    parked_s = max(0, total_period_s - drive_s - idle_s)
                 except ValueError:
                     pass
 
@@ -271,12 +288,6 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
 # Tratamento dos segmentos da rota
 # =========================
 def extract_idle_duration_from_step(step: dict, duration_s: float) -> float:
-    """
-    Tenta identificar tempo de motor ocioso dentro de um step de parada.
-
-    A API pode variar o nome do campo dependendo do endpoint/versão.
-    Por isso, testamos alguns nomes comuns. Se nada existir, retorna 0.
-    """
     possible_keys = [
         "idle_time_duration",
         "idle_duration",
@@ -290,12 +301,10 @@ def extract_idle_duration_from_step(step: dict, duration_s: float) -> float:
     for key in possible_keys:
         if key in step:
             value = safe_number(step.get(key))
-            # Se vier em milissegundos, converte para segundos.
             if value > duration_s * 10 and value > 1000:
                 value = value / 1000
             return max(0, min(value, duration_s))
 
-    # Alguns retornos podem trazer metadados aninhados.
     for nested_key in ["stop", "stops", "metadata", "properties"]:
         nested = step.get(nested_key)
         if isinstance(nested, dict):
@@ -306,7 +315,6 @@ def extract_idle_duration_from_step(step: dict, duration_s: float) -> float:
                         value = value / 1000
                     return max(0, min(value, duration_s))
 
-    # Fallback por sinal de ignição ligada, se existir.
     ignition_fields = ["ignition_on", "ignitionOn", "engine_on", "engineOn", "vehicle_on", "vehicleOn"]
     for field in ignition_fields:
         if field in step and step.get(field) is True:
@@ -316,14 +324,6 @@ def extract_idle_duration_from_step(step: dict, duration_s: float) -> float:
 
 
 def build_route_segments(route_data: list, timezone_name: str) -> pd.DataFrame:
-    """
-    Transforma os route_steps em segmentos para a linha do tempo.
-
-    Tipos finais:
-    - trip: em movimento
-    - idle: parado com motor ligado
-    - parked: parado normal
-    """
     rows = []
 
     for route in route_data:
@@ -357,7 +357,6 @@ def build_route_segments(route_data: list, timezone_name: str) -> pd.DataFrame:
                 idle_s = extract_idle_duration_from_step(step, duration_s)
                 parked_s = max(0, duration_s - idle_s)
 
-                # Se houver motor ocioso, pintamos primeiro a parte ociosa.
                 if idle_s > 0:
                     idle_end = min(end_dt, start_dt + timedelta(seconds=idle_s))
                     rows.append(
@@ -459,7 +458,6 @@ def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str, colo
 
 
 def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
-    """Monta uma linha do tempo por dia com cores fixas para os 3 estados."""
     reference = datetime(2000, 1, 1)
 
     def to_reference_time(dt: datetime) -> datetime:
@@ -475,7 +473,6 @@ def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
         y = y_map[day]
         day_label = pd.Timestamp(day).strftime("%d/%m/%Y")
 
-        # Fundo do dia inteiro.
         fig.add_trace(
             go.Scatter(
                 x=[reference, reference + timedelta(hours=24)],
