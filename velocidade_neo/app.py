@@ -415,16 +415,6 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
     fig.add_trace(
         go.Bar(
             x=df["data_fmt"],
-            y=df["tempo_ocioso_h"].round(2),
-            name="Motor ocioso",
-            marker_color=COLOR_OCIOSO,
-            hovertemplate="<b>%{x}</b><br>Motor ocioso: %{y:.2f}h<extra></extra>",
-        )
-    )
-
-    fig.add_trace(
-        go.Bar(
-            x=df["data_fmt"],
             y=df["tempo_parado_normal_h"].round(2),
             name="Parado normal",
             marker_color=COLOR_PARADO_NORMAL,
