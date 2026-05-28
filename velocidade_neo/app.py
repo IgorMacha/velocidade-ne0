@@ -459,6 +459,62 @@ def build_daily_from_segments(segments: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Gráficos
 # =========================
+
+
+def make_timeline_chart(segments: pd.DataFrame, vehicle_plate: str) -> go.Figure:
+    """
+    Monta uma linha do tempo com os segmentos retornados pela API vehicle-route.
+
+    Tipos esperados em segments["tipo"]:
+    - trip   -> Em movimento
+    - idle   -> Motor ocioso
+    - parked -> Parado normal
+    """
+    fig = go.Figure()
+
+    for tipo in ["trip", "idle", "parked"]:
+        subset = segments[segments["tipo"] == tipo]
+
+        if subset.empty:
+            continue
+
+        label = TIMELINE_LABELS.get(tipo, tipo)
+        color = TIMELINE_COLORS.get(tipo, COLOR_FUNDO_LINHA)
+
+        for _, row in subset.iterrows():
+            fig.add_trace(
+                go.Scatter(
+                    x=[row["inicio"], row["fim"]],
+                    y=[label, label],
+                    mode="lines",
+                    line=dict(color=color, width=18),
+                    name=label,
+                    legendgroup=label,
+                    showlegend=not any(
+                        trace.name == label for trace in fig.data
+                    ),
+                    hovertemplate=(
+                        f"<b>{label}</b><br>"
+                        + "Início: %{x|%d/%m/%Y %H:%M}<br>"
+                        + f"Duração: {fmt_duration(row['duracao_s'])}"
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+
+    fig.update_layout(
+        title=f"Linha do tempo — {vehicle_plate}",
+        xaxis_title="Horário",
+        yaxis_title="Status",
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=70, b=40),
+    )
+
+    fig.update_xaxes(type="date")
+
+    return fig
+
 def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
 
