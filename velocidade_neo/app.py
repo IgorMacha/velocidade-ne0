@@ -197,16 +197,14 @@ def parse_summary_date(summary: dict):
     return None
 
 
-def _resolve_stop_total(stops: dict) -> float:
-    """
-    Tenta extrair a duração total de paradas do objeto stops.
-    A API pode retornar esse campo com nomes diferentes dependendo da versão.
-    """
-    for key in ["duration", "total_duration", "totalDuration", "stop_duration", "stopDuration", "total_time"]:
-        val = safe_number(stops.get(key))
-        if val > 0:
-            return val
-    return 0
+def _parse_dt(text: str):
+    """Converte string ISO da API em datetime, ou None se inválida."""
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("T", " ").strip())
+    except ValueError:
+        return None
 
 
 def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
@@ -223,52 +221,26 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
             start_address = summary.get("start_address") or {}
             end_address = summary.get("end_address") or {}
 
-            stop_total_s = _resolve_stop_total(stops)
-            idle_s = safe_number(stops.get("idle_time_duration"))
-            parked_s = max(0, stop_total_s - idle_s)
+            # Converte datas para datetime agora — evita strings vazias no groupby
+            inicio_dt = _parse_dt(start_address.get("date") or "")
+            fim_dt = _parse_dt(end_address.get("date") or "")
 
+            # Campos confirmados pelo schema da API Cobli
             drive_s = safe_number(trip.get("duration"))
-            start_text = (start_address.get("date") or "").replace("T", " ")
-            end_text = (end_address.get("date") or "").replace("T", " ")
-
-            # Fallback para drive_s zerado
-            if drive_s == 0 and start_text and end_text:
-                try:
-                    start_dt = datetime.fromisoformat(start_text)
-                    end_dt = datetime.fromisoformat(end_text)
-                    active_s = (end_dt - start_dt).total_seconds()
-                    drive_s = max(0, active_s - stop_total_s)
-                except ValueError:
-                    pass
-
-            # -------------------------------------------------------
-            # Fallback para parked_s zerado:
-            # Se a API não retornou o total de paradas (ou retornou só
-            # o tempo ocioso sem o total), calcula pela diferença entre
-            # o período completo do dia e os tempos já conhecidos.
-            # -------------------------------------------------------
-            if parked_s == 0 and start_text and end_text:
-                try:
-                    start_dt = datetime.fromisoformat(start_text)
-                    end_dt = datetime.fromisoformat(end_text)
-                    total_period_s = (end_dt - start_dt).total_seconds()
-                    parked_s = max(0, total_period_s - drive_s - idle_s)
-                except ValueError:
-                    pass
+            stop_total_s = safe_number(stops.get("duration"))   # total paradas (ocioso + normal)
+            idle_s = safe_number(stops.get("idle_time_duration"))
 
             rows.append(
                 {
                     "data": raw_date,
-                    "inicio": start_text,
-                    "fim": end_text,
+                    "inicio_dt": inicio_dt,
+                    "fim_dt": fim_dt,
+                    "inicio": (start_address.get("date") or "").replace("T", " ").strip(),
+                    "fim": (end_address.get("date") or "").replace("T", " ").strip(),
                     "distancia_km": safe_number(trip.get("distance_in_meters")) / 1000,
                     "tempo_rodando_s": drive_s,
-                    "tempo_rodando_h": drive_s / 3600,
-                    "tempo_parado_s": stop_total_s,
                     "tempo_ocioso_s": idle_s,
-                    "tempo_ocioso_h": idle_s / 3600,
-                    "tempo_parado_normal_s": parked_s,
-                    "tempo_parado_normal_h": parked_s / 3600,
+                    "tempo_parado_s": stop_total_s,
                     "paradas": int(safe_number(stops.get("count"))),
                     "paradas_geofence": int(safe_number(stops.get("count_in_geofence"))),
                 }
@@ -279,7 +251,50 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
         return df
 
     df["data"] = pd.to_datetime(df["data"], errors="coerce")
-    df = df.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
+    df = df.dropna(subset=["data"])
+
+    # A API pode retornar múltiplas entradas por dia (ex: troca de motorista).
+    # Agrupa por data: soma durações, mantém o intervalo mais amplo do dia.
+    # Usa objetos datetime (não strings) no min/max para evitar bug com string vazia.
+    df["inicio_dt"] = pd.to_datetime(df["inicio_dt"])
+    df["fim_dt"] = pd.to_datetime(df["fim_dt"])
+
+    df = (
+        df.groupby("data", as_index=False)
+        .agg(
+            inicio_dt=("inicio_dt", "min"),
+            fim_dt=("fim_dt", "max"),
+            inicio=("inicio", lambda s: next((v for v in sorted(s) if v), "")),
+            fim=("fim", lambda s: next((v for v in sorted(s, reverse=True) if v), "")),
+            distancia_km=("distancia_km", "sum"),
+            tempo_rodando_s=("tempo_rodando_s", "sum"),
+            tempo_ocioso_s=("tempo_ocioso_s", "sum"),
+            tempo_parado_s=("tempo_parado_s", "sum"),
+            paradas=("paradas", "sum"),
+            paradas_geofence=("paradas_geofence", "sum"),
+        )
+    )
+
+    def calc_parked(row):
+        # Tentativa 1: API retornou stops.duration corretamente
+        parked_s = max(0.0, row["tempo_parado_s"] - row["tempo_ocioso_s"])
+
+        # Tentativa 2: fallback com objetos datetime (imune a strings vazias)
+        if parked_s == 0:
+            start = row["inicio_dt"]
+            end = row["fim_dt"]
+            if pd.notna(start) and pd.notna(end) and end > start:
+                total_s = (end - start).total_seconds()
+                parked_s = max(0.0, total_s - row["tempo_rodando_s"] - row["tempo_ocioso_s"])
+
+        return parked_s
+
+    df["tempo_parado_normal_s"] = df.apply(calc_parked, axis=1)
+    df["tempo_parado_normal_h"] = df["tempo_parado_normal_s"] / 3600
+    df["tempo_rodando_h"] = df["tempo_rodando_s"] / 3600
+    df["tempo_ocioso_h"] = df["tempo_ocioso_s"] / 3600
+
+    df = df.sort_values("data").reset_index(drop=True)
     df["data_fmt"] = df["data"].dt.strftime("%d/%m")
     return df
 
