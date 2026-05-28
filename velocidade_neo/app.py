@@ -516,6 +516,15 @@ def make_timeline_chart(segments: pd.DataFrame, vehicle_plate: str) -> go.Figure
     return fig
 
 def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
+    """
+    Gráfico empilhado de tempo por dia.
+
+    Importante: quando existir a API de segmentos/vehicle-route, use o DataFrame
+    criado por build_daily_from_segments(segments), porque ele separa melhor:
+    - Em movimento
+    - Motor ocioso
+    - Parado normal
+    """
     fig = go.Figure()
 
     fig.add_trace(
@@ -527,6 +536,17 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
             hovertemplate="<b>%{x}</b><br>Em movimento: %{y:.2f}h<extra></extra>",
         )
     )
+
+    if "tempo_ocioso_h" in df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=df["data_fmt"],
+                y=df["tempo_ocioso_h"].round(2),
+                name="Motor ocioso",
+                marker_color=COLOR_OCIOSO,
+                hovertemplate="<b>%{x}</b><br>Motor ocioso: %{y:.2f}h<extra></extra>",
+            )
+        )
 
     fig.add_trace(
         go.Bar(
@@ -548,7 +568,6 @@ def make_stacked_time_chart(df: pd.DataFrame) -> go.Figure:
     )
 
     return fig
-
 
 def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str, color: str) -> go.Figure:
     fig = go.Figure(
@@ -623,6 +642,12 @@ try:
 
     st.divider()
 
+    # Por padrão, o gráfico diário usa o resumo da API paths/summary.
+    # Se a API vehicle-route retornar segmentos, substituímos os tempos do gráfico
+    # pelos segmentos reais, porque o summary pode vir com trip.duration zerado
+    # e acabar mostrando tudo como "Parado normal".
+    df_time_chart = df.copy()
+
     if vehicle_id:
         with st.spinner("Carregando linha do tempo..."):
             begin_ms = date_to_ms(start_date, timezone, end_of_day=False)
@@ -641,6 +666,10 @@ try:
             r3.metric("Parado normal real", fmt_duration(real_parked_s))
             r4.metric("Segmentos", len(segments))
 
+            daily_from_segments = build_daily_from_segments(segments)
+            if not daily_from_segments.empty:
+                df_time_chart = daily_from_segments
+
             if real_idle_s == 0:
                 st.caption(
                     "Observação: se a API de rota não retornar o tempo de motor ocioso por parada, "
@@ -653,7 +682,7 @@ try:
 
     st.divider()
 
-    st.plotly_chart(make_stacked_time_chart(df), use_container_width=True)
+    st.plotly_chart(make_stacked_time_chart(df_time_chart), use_container_width=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
