@@ -226,9 +226,18 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
             fim_dt = _parse_dt(end_address.get("date") or "")
 
             # Campos confirmados pelo schema da API Cobli
-            drive_s = safe_number(trip.get("duration"))
+            drive_s     = safe_number(trip.get("duration"))
             stop_total_s = safe_number(stops.get("duration"))   # total paradas (ocioso + normal)
-            idle_s = safe_number(stops.get("idle_time_duration"))
+            idle_s      = safe_number(stops.get("idle_time_duration"))
+
+            # ── Fallback para drive_s ──────────────────────────────────────────
+            # trip.duration pode vir zerado na API para alguns veículos/períodos.
+            # Se temos o total de paradas (stops.duration > 0), estimamos o tempo
+            # em movimento como: período_total - tempo_de_parada.
+            # Isso evita que o fallback de parked roube o espaço do movimento.
+            if drive_s == 0 and stop_total_s > 0 and inicio_dt and fim_dt:
+                periodo_s = (fim_dt - inicio_dt).total_seconds()
+                drive_s = max(0.0, periodo_s - stop_total_s)
 
             rows.append(
                 {
@@ -276,18 +285,20 @@ def build_summary_dataframe(summary_data: list) -> pd.DataFrame:
     )
 
     def calc_parked(row):
-        # Tentativa 1: API retornou stops.duration corretamente
-        parked_s = max(0.0, row["tempo_parado_s"] - row["tempo_ocioso_s"])
+        # Tentativa 1: stops.duration existe → parado normal = total_paradas - ocioso
+        if row["tempo_parado_s"] > 0:
+            return max(0.0, row["tempo_parado_s"] - row["tempo_ocioso_s"])
 
-        # Tentativa 2: fallback com objetos datetime (imune a strings vazias)
-        if parked_s == 0:
-            start = row["inicio_dt"]
-            end = row["fim_dt"]
-            if pd.notna(start) and pd.notna(end) and end > start:
-                total_s = (end - start).total_seconds()
-                parked_s = max(0.0, total_s - row["tempo_rodando_s"] - row["tempo_ocioso_s"])
+        # Tentativa 2: stops.duration = 0 → usa período total - movimento - ocioso
+        # (só entra aqui se a API não retornou stops.duration; drive_s já foi
+        #  corrigido pelo fallback por entrada, então esse total não é roubado)
+        start = row["inicio_dt"]
+        end = row["fim_dt"]
+        if pd.notna(start) and pd.notna(end) and end > start:
+            total_s = (end - start).total_seconds()
+            return max(0.0, total_s - row["tempo_rodando_s"] - row["tempo_ocioso_s"])
 
-        return parked_s
+        return 0.0
 
     df["tempo_parado_normal_s"] = df.apply(calc_parked, axis=1)
     df["tempo_parado_normal_h"] = df["tempo_parado_normal_s"] / 3600
@@ -411,6 +422,40 @@ def build_route_segments(route_data: list, timezone_name: str) -> pd.DataFrame:
     return df.sort_values("inicio").reset_index(drop=True)
 
 
+def build_daily_from_segments(segments: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrega os segmentos de rota por dia.
+    Fonte dos dados: API vehicle-route (confiável para tempo).
+    Retorna DataFrame com as mesmas colunas de tempo usadas no gráfico de barras.
+    """
+    if segments.empty:
+        return pd.DataFrame()
+
+    seg = segments.copy()
+    seg["data"] = seg["inicio"].dt.normalize()  # dia sem hora
+
+    rows = []
+    for day, group in seg.groupby("data"):
+        drive_s  = group.loc[group["tipo"] == "trip",   "duracao_s"].sum()
+        idle_s   = group.loc[group["tipo"] == "idle",   "duracao_s"].sum()
+        parked_s = group.loc[group["tipo"] == "parked", "duracao_s"].sum()
+        rows.append(
+            {
+                "data":                  pd.Timestamp(day),
+                "tempo_rodando_s":       drive_s,
+                "tempo_ocioso_s":        idle_s,
+                "tempo_parado_normal_s": parked_s,
+                "tempo_rodando_h":       round(drive_s  / 3600, 2),
+                "tempo_ocioso_h":        round(idle_s   / 3600, 2),
+                "tempo_parado_normal_h": round(parked_s / 3600, 2),
+            }
+        )
+
+    df = pd.DataFrame(rows).sort_values("data").reset_index(drop=True)
+    df["data_fmt"] = df["data"].dt.strftime("%d/%m")
+    return df
+
+
 # =========================
 # Gráficos
 # =========================
@@ -459,90 +504,6 @@ def make_bar_chart(df: pd.DataFrame, column: str, title: str, y_label: str, colo
         )
     )
     fig.update_layout(title=title, xaxis_title="Data", yaxis_title=y_label, height=320)
-    return fig
-
-
-def make_timeline_chart(segments: pd.DataFrame, plate: str) -> go.Figure:
-    reference = datetime(2000, 1, 1)
-
-    def to_reference_time(dt: datetime) -> datetime:
-        return reference + timedelta(hours=dt.hour, minutes=dt.minute, seconds=dt.second)
-
-    days = sorted(segments["inicio"].dt.date.unique(), reverse=True)
-    y_map = {day: index for index, day in enumerate(days)}
-
-    fig = go.Figure()
-    legend_added = set()
-
-    for day, group in segments.groupby(segments["inicio"].dt.date, sort=False):
-        y = y_map[day]
-        day_label = pd.Timestamp(day).strftime("%d/%m/%Y")
-
-        fig.add_trace(
-            go.Scatter(
-                x=[reference, reference + timedelta(hours=24)],
-                y=[y, y],
-                mode="lines",
-                line=dict(color=COLOR_FUNDO_LINHA, width=20),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-        for _, segment in group.iterrows():
-            start = max(segment["inicio"].to_pydatetime(), datetime.combine(day, datetime.min.time()))
-            end = min(segment["fim"].to_pydatetime(), datetime.combine(day, datetime.max.time().replace(second=59)))
-
-            if start >= end:
-                continue
-
-            tipo = segment["tipo"]
-            label = TIMELINE_LABELS.get(tipo, tipo)
-            color = TIMELINE_COLORS.get(tipo, "#000000")
-            duration = fmt_duration(segment["duracao_s"])
-            show_legend = label not in legend_added
-
-            fig.add_trace(
-                go.Scatter(
-                    x=[to_reference_time(start), to_reference_time(end)],
-                    y=[y, y],
-                    mode="lines",
-                    name=label,
-                    legendgroup=label,
-                    line=dict(color=color, width=16),
-                    hovertemplate=(
-                        f"<b>{plate} — {day_label}</b><br>"
-                        f"{label}<br>"
-                        f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}<br>"
-                        f"Duração: {duration}<extra></extra>"
-                    ),
-                    showlegend=show_legend,
-                )
-            )
-
-            if show_legend:
-                legend_added.add(label)
-
-    tick_hours = list(range(0, 25, 2))
-    fig.update_layout(
-        title="Linha do tempo — movimento, motor ocioso e parado normal",
-        height=max(300, len(days) * 55 + 120),
-        margin=dict(l=10, r=10, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis=dict(
-            tickvals=[reference + timedelta(hours=h) for h in tick_hours],
-            ticktext=[f"{h:02d}:00" for h in tick_hours],
-            range=[reference, reference + timedelta(hours=24)],
-            title="Horário",
-            showgrid=True,
-        ),
-        yaxis=dict(
-            tickvals=list(y_map.values()),
-            ticktext=[pd.Timestamp(day).strftime("%d/%m") for day in days],
-            title="Dia",
-        ),
-    )
-
     return fig
 
 
